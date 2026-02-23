@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "WeightControlPlugin": {
+      "commandName": "Project"
+    },
+    "プロファイル 1": {
+      "commandName": "Executable",
+      "executablePath": "C:\\Users\\ADMIN\\YukkuriMovieMaker_v4_Lite\\YukkuriMovieMaker.exe"
+    }
+  }
+}
