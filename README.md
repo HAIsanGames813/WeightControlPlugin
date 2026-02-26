@@ -1,6 +1,8 @@
 # 制御文字プラグイン
 
 ### 現在はβ版を配布しています。
+## ダウンロード
+https://github.com/HAIsanGames813/WeightControlPlugin/releases/tag/%CE%B21
 
 ## 概要
 AviUtlにある制御文字を一部使用可能しました
