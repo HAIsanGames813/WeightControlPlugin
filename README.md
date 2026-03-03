@@ -1,17 +1,17 @@
 # 制御文字プラグイン
 
-### 現在はβ版を配布しています。
 ## ダウンロード
-https://github.com/HAIsanGames813/WeightControlPlugin/releases/tag/%CE%B21
+プラグインポータルまたは[ここから](https://github.com/HAIsanGames813/WeightControlPlugin/release)ダウンロード
 
 ## 概要
 AviUtlにある制御文字を一部使用可能しました
 ### 使用可能な制御文字
-\<w> \<w*> \<c> \<p>
+\<w> \<w*> \<c> \<c*> \<p>
 
 ### 他の制御文字について
 フォント変更、サイズ変更、色変更はYMM4の標準機能で使用可能なため追加しません  
 装飾色の変更は標準機能ではできないですが追加予定はありません
+
 ## EXO出力について
 EXOで引き継がれますが若干処理が違う点があります
 
