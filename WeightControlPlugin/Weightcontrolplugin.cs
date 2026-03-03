@@ -23,7 +23,11 @@ internal static class Startup
     public static void Run()
     {
         if (System.Threading.Interlocked.Exchange(ref _ran, 1) != 0) return;
-        RichTextEditorPatcher.Apply();
-        WeightTextSourcePatcher.Apply();
+
+        // 各パッチャーを個別に try-catch: 1つ失敗しても他は続行
+        try { RichTextEditorPatcher.Apply(); } catch { }  // TextItem テキスト入力UI
+        try { SerifTextBoxPatcher.Apply(); } catch { }  // VoiceItem セリフ入力UI
+        try { VoiceItemPatcher.Apply(); } catch { }  // Hatsuon から制御タグを除去
+        try { WeightTextSourcePatcher.Apply(); } catch { }  // 映像レンダラーパッチ
     }
 }

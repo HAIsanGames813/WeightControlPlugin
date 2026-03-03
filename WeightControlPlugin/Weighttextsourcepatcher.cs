@@ -2,7 +2,7 @@
 using System.Collections;
 using System.Drawing;
 using System.Reflection;
-using System.Text.RegularExpressions;
+using System.Runtime.CompilerServices;
 
 namespace WeightControlPlugin;
 
@@ -11,41 +11,42 @@ internal static class WeightTextSourcePatcher
     private const string HarmonyId = "com.weightcontrolplugin.textsource";
     private static Harmony? _harmony;
 
-    private static Type? _textItemType;
-    private static PropertyInfo? _tiTextProp;
+    private sealed class SourceTypeInfo
+    {
+        public required PropertyInfo OutputsProp;
+        public required FieldInfo ItemField;
+        public required Func<object, string?> GetText;
+    }
 
-    private static FieldInfo? _tsItemField;
-    private static FieldInfo? _tsOutputsListField;
-    private static FieldInfo? _tsIsDividedField;
-    private static FieldInfo? _tsDisplayIntField;
-    private static FieldInfo? _tsHideIntField;
-    private static PropertyInfo? _tsOutputsProp;
+    // DrawingOffset フィールド (SourceOutput に存在、遅延初期化)
+    private static FieldInfo? _drawingOffsetField;
+    private static readonly object _drawingOffsetLock = new();
 
-    private static FieldInfo? _soTimeOffsetField;
-    private static FieldInfo? _soDurationOffsetField;
-    private static FieldInfo? _soDrawingOffsetField;
-
-    private const double ForcedInterval = 0.001;
-
-    // TextItem ごとの「全文字の初期自然位置キャッシュ」
-    // TextSource が毎フレーム出力数が変わっても位置が不変になるよう保持する
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, NaturalPosCache>
-        _posCache = new();
-
+    // source インスタンスごとの「全文字の自然位置キャッシュ」
     private sealed class NaturalPosCache
     {
         public PointF[] Positions = Array.Empty<PointF>();
-        public int Count;
         public string Text = string.Empty;
+        public int Count;
+        // 前回書き込んだ output[0] の DrawingOffset を保存する。
+        // YMM4 が outputs を再生成したとき (BasePoint 変更など) は
+        // output[0] の値がここと異なるのでキャッシュを破棄できる。
+        public PointF LastWrittenPos0;
     }
+    private static readonly ConditionalWeakTable<object, NaturalPosCache> _posCache = new();
+
+    private static readonly Dictionary<Type, SourceTypeInfo?> _typeCache = new();
+    private static readonly object _cacheLock = new();
+    private static readonly ConditionalWeakTable<object, object> _taggedChars = new();
+    private static readonly object _marker = new();
 
     // -----------------------------------------------------------------
-
     public static void Apply()
     {
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            TryPatch(asm);
-        AppDomain.CurrentDomain.AssemblyLoad += (_, args) => TryPatch(args.LoadedAssembly);
+            try { TryPatch(asm); } catch { }
+        AppDomain.CurrentDomain.AssemblyLoad += (_, args) =>
+        { try { TryPatch(args.LoadedAssembly); } catch { } };
     }
 
     private static void TryPatch(Assembly asm)
@@ -59,60 +60,119 @@ internal static class WeightTextSourcePatcher
         catch { return; }
         if (types == null) return;
 
-        _textItemType = types.FirstOrDefault(t => t.FullName == "YukkuriMovieMaker.Project.Items.TextItem");
-        var textSourceType = types.FirstOrDefault(t => t.FullName == "YukkuriMovieMaker.Player.Video.Items.TextSource");
-        var layoutDescType = types.FirstOrDefault(t => t.Name == "TextLayoutDescription");
-
-        _tiTextProp = _textItemType?.GetProperty("Text", BindingFlags.Instance | BindingFlags.Public);
-
-        if (textSourceType != null)
-        {
-            _tsItemField = NF(textSourceType, "item");
-            _tsOutputsListField = NF(textSourceType, "outputs");
-            _tsIsDividedField = NF(textSourceType, "isDevided");
-            _tsDisplayIntField = NF(textSourceType, "displayInterval");
-            _tsHideIntField = NF(textSourceType, "hideInterval");
-            _tsOutputsProp = textSourceType.GetProperty("Outputs",
-                BindingFlags.Instance | BindingFlags.Public);
-        }
-
         _harmony = new Harmony(HarmonyId);
 
-        if (layoutDescType != null)
+        // TextLayoutDescription ctor: タグ除去
+        var ldType = types.FirstOrDefault(t => t.Name == "TextLayoutDescription");
+        if (ldType != null)
         {
-            var ctor = layoutDescType
-                .GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                .FirstOrDefault(c => c.GetParameters().Any(p => p.ParameterType == typeof(string)));
-            if (ctor != null)
-                _harmony.Patch(ctor,
-                    prefix: new HarmonyMethod(typeof(WeightTextSourcePatcher), nameof(PatchLayoutDescCtor)));
+            try
+            {
+                var ctor = ldType
+                    .GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(c => c.GetParameters().Any(p => p.ParameterType == typeof(string)));
+                if (ctor != null)
+                    _harmony.Patch(ctor,
+                        prefix: new HarmonyMethod(typeof(WeightTextSourcePatcher), nameof(PatchLayoutDescCtor)));
+            }
+            catch { }
         }
 
-        if (_textItemType != null)
+        // IsDevidedPerCharacter=true, DisplayInterval=0, HideInterval=0 に強制
+        // → GetDisplayOutputs が全文字を Outputs に返す
+        foreach (var t in types)
         {
-            PatchGetter(_textItemType, "IsDevidedPerCharacter", nameof(Patch_IsDevided));
-            PatchGetter(_textItemType, "DisplayInterval", nameof(Patch_DisplayInt));
-            PatchGetter(_textItemType, "HideInterval", nameof(Patch_HideInt));
+            try
+            {
+                if (t.GetProperty("IsDevidedPerCharacter",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) == null) continue;
+
+                bool isItem = t.FullName?.StartsWith("YukkuriMovieMaker.Project.Items.") ?? false;
+                if (isItem)
+                {
+                    PatchGetter(t, "IsDevidedPerCharacter", nameof(Getter_IsDevided_Item));
+                    PatchGetter(t, "DisplayInterval", nameof(Getter_DisplayInt_Item));
+                    PatchGetter(t, "HideInterval", nameof(Getter_HideInt_Item));
+                }
+                else
+                {
+                    PatchGetter(t, "IsDevidedPerCharacter", nameof(Getter_IsDevided_Char));
+                    PatchGetter(t, "DisplayInterval", nameof(Getter_DisplayInt_Char));
+                    PatchGetter(t, "HideInterval", nameof(Getter_HideInt_Char));
+                }
+            }
+            catch { }
         }
 
-        if (textSourceType != null)
+        // TextSource / JimakuSource の Update をパッチ
+        foreach (var srcType in types)
         {
-            var update = textSourceType.GetMethod("Update",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (update != null)
+            try
+            {
+                if (FindField(srcType, "outputs") == null) continue;
+                if (FindField(srcType, "isDevided", "isDivided") == null) continue;
+                if (srcType.GetField("item", BindingFlags.Instance | BindingFlags.NonPublic) == null) continue;
+                if (srcType.GetProperty("Outputs", BindingFlags.Instance | BindingFlags.Public) == null) continue;
+
+                var update = srcType.GetMethod("Update",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (update == null) continue;
+
                 _harmony.Patch(update,
-                    postfix: new HarmonyMethod(typeof(WeightTextSourcePatcher), nameof(PatchUpdate)));
+                    prefix: new HarmonyMethod(typeof(WeightTextSourcePatcher), nameof(PrefixUpdate)),
+                    postfix: new HarmonyMethod(typeof(WeightTextSourcePatcher), nameof(PostfixUpdate)));
+            }
+            catch { }
         }
     }
 
-    private static void PatchGetter(Type type, string prop, string method)
+    private static void PatchGetter(Type t, string prop, string method)
     {
-        var g = type.GetProperty(prop,
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            ?.GetGetMethod(nonPublic: true);
+        var g = t.GetProperty(prop, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                 ?.GetGetMethod(nonPublic: true);
         if (g != null)
             _harmony!.Patch(g, postfix: new HarmonyMethod(typeof(WeightTextSourcePatcher), method));
     }
+
+    // ----------------------------------------------------------------- ゲッターパッチ
+
+    [HarmonyPostfix]
+    private static void Getter_IsDevided_Item(object __instance, ref bool __result)
+    { if (ItemHasTag(__instance)) __result = true; }
+
+    [HarmonyPostfix]
+    private static void Getter_DisplayInt_Item(object __instance, ref double __result)
+    { if (ItemHasTag(__instance)) __result = 0.0; }
+
+    [HarmonyPostfix]
+    private static void Getter_HideInt_Item(object __instance, ref double __result)
+    { if (ItemHasTag(__instance)) __result = 0.0; }
+
+    [HarmonyPostfix]
+    private static void Getter_IsDevided_Char(object __instance, ref bool __result)
+    { if (_taggedChars.TryGetValue(__instance, out _)) __result = true; }
+
+    [HarmonyPostfix]
+    private static void Getter_DisplayInt_Char(object __instance, ref double __result)
+    { if (_taggedChars.TryGetValue(__instance, out _)) __result = 0.0; }
+
+    [HarmonyPostfix]
+    private static void Getter_HideInt_Char(object __instance, ref double __result)
+    { if (_taggedChars.TryGetValue(__instance, out _)) __result = 0.0; }
+
+    private static bool ItemHasTag(object item)
+    {
+        foreach (var name in new[] { "Serif", "Text", "Body", "Content" })
+        {
+            var v = item.GetType()
+                .GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                ?.GetValue(item) as string;
+            if (v != null) return WeightTagParser.HasControlTags(v);
+        }
+        return false;
+    }
+
+    // ----------------------------------------------------------------- TextLayoutDescription ctor
 
     [HarmonyPrefix]
     private static void PatchLayoutDescCtor(object[] __args)
@@ -123,98 +183,159 @@ internal static class WeightTextSourcePatcher
                 __args[i] = WeightTagParser.RemoveTags(s);
     }
 
-    [HarmonyPostfix]
-    private static void Patch_IsDevided(object __instance, ref bool __result)
-    { if (HasTag(__instance)) __result = true; }
-    [HarmonyPostfix]
-    private static void Patch_DisplayInt(object __instance, ref double __result)
-    { if (HasTag(__instance)) __result = Math.Max(__result, ForcedInterval); }
-    [HarmonyPostfix]
-    private static void Patch_HideInt(object __instance, ref double __result)
-    { if (HasTag(__instance)) __result = Math.Max(__result, ForcedInterval); }
+    // ----------------------------------------------------------------- Update prefix
 
-    private static bool HasTag(object ti) =>
-        _tiTextProp?.GetValue(ti) is string t && WeightTagParser.HasControlTags(t);
-
-    [HarmonyPostfix]
-    private static void PatchUpdate(object __instance, object timelineItemSourceDescription)
+    [HarmonyPrefix]
+    private static void PrefixUpdate(object __instance)
     {
-        try { ApplyTagEffects(__instance, timelineItemSourceDescription); }
+        try
+        {
+            var info = GetInfo(__instance);
+            if (info == null) return;
+            var item = info.ItemField.GetValue(__instance);
+            if (item == null) return;
+
+            bool hasTag = WeightTagParser.HasControlTags(info.GetText(__instance));
+
+            var character = item.GetType()
+                .GetProperty("Character", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                ?.GetValue(item);
+            if (character == null) return;
+
+            if (hasTag)
+                _taggedChars.AddOrUpdate(character, _marker);
+            else
+                _taggedChars.Remove(character);
+        }
         catch { }
     }
 
-    // =================================================================
-    // メイン処理
-    // =================================================================
+    // ----------------------------------------------------------------- Update postfix
+    // __args を使う: TextSource と JimakuSource でパラメータ名が異なるため
 
-    private static void ApplyTagEffects(object ts, object tsDesc)
+    [HarmonyPostfix]
+    private static void PostfixUpdate(object __instance, object[] __args)
     {
-        var item = _tsItemField?.GetValue(ts);
-        if (item == null) return;
-        var original = _tiTextProp?.GetValue(item) as string ?? "";
+        try
+        {
+            var tsDesc = (__args != null && __args.Length > 0) ? __args[0] : null;
+            FilterOutputsByTags(__instance, tsDesc);
+        }
+        catch { }
+    }
+
+    // ================================================================= メイン処理
+
+    private static void FilterOutputsByTags(object ts, object? tsDesc)
+    {
+        var info = GetInfo(ts);
+        if (info == null) return;
+
+        var original = info.GetText(ts) ?? "";
         if (!WeightTagParser.HasControlTags(original)) return;
 
-        var list = _tsOutputsListField?.GetValue(ts) as IList;
-        if (list == null || list.Count == 0) return;
+        // displayInterval=0 により GetDisplayOutputs が全文字を Outputs に入れている
+        var allOutputs = info.OutputsProp.GetValue(ts) as System.Collections.Generic.IReadOnlyList<object>;
+        if (allOutputs == null || allOutputs.Count == 0) return;
 
-        EnsureCache(list[0]!);
-        if (_soTimeOffsetField == null) return;
+        int count = allOutputs.Count;
+        double now = GetTimeSec(tsDesc, "ItemPosition");
 
-        var duration = GetTime(tsDesc, "ItemDuration");
-        var now = GetTime(tsDesc, "ItemPosition");
+        // DrawingOffset フィールドの遅延初期化
+        EnsureDrawingOffsetField(allOutputs[0]);
 
         var (cleanText, tokens) = WeightTagParser.Parse(original);
 
-        int visCount = cleanText.Count(c => c != '\r' && c != '\n');
-        int count = list.Count;
-        bool listHasNl = (count > visCount);
+        // 改行を除いた文字数
+        int visChars = 0;
+        foreach (char c in cleanText)
+            if (c != '\r' && c != '\n') visChars++;
 
-        int TagPosToListIdx(int rawPos)
+        if (count < 2 && visChars > 1) return;
+
+        // ── 自然位置キャッシュ ────────────────────────────────────────────
+        // テキスト・文字数変化、または YMM4 が outputs を再生成したときにキャッシュを破棄する。
+        // 再生成検出: 前回書き込んだ output[0] の値と現在値が異なれば再生成済み。
+        var cache = _posCache.GetOrCreateValue(ts);
+        bool cacheInvalid = cache.Count != count || cache.Text != original;
+        if (!cacheInvalid && count > 0)
         {
-            rawPos = Math.Min(rawPos, cleanText.Length);
-            if (listHasNl) return Math.Clamp(rawPos, 0, count);
-            int nl = 0;
-            for (int i = 0; i < rawPos; i++)
-                if (cleanText[i] == '\r' || cleanText[i] == '\n') nl++;
-            return Math.Clamp(rawPos - nl, 0, count);
+            var cur0 = ReadDrawingOffset(allOutputs[0]);
+            if (cur0.X != cache.LastWrittenPos0.X || cur0.Y != cache.LastWrittenPos0.Y)
+                cacheInvalid = true;
         }
-
-        // ── 自然位置キャッシュ ──────────────────────────────────
-        // TextSource が毎フレームlistを再生成するかどうかに関わらず、
-        // list.Count が全文字数と一致したフレームの位置を固定して使う。
-        // こうすることで RebuildOutputs で一部を除外した後のフレームでも
-        // 位置計算の基準が変わらない。
-        var cache = _posCache.GetOrCreateValue(item);
-        if (list.Count >= cache.Count || cache.Text != original)
+        if (cacheInvalid)
         {
-            // 全文字が揃っているフレーム → キャッシュを更新
-            cache.Count = list.Count;
+            cache.Count = count;
             cache.Text = original;
-            cache.Positions = new PointF[list.Count];
-            for (int i = 0; i < list.Count; i++)
-                cache.Positions[i] = ReadOffset(list[i]!);
+            cache.Positions = new PointF[count];
+            for (int i = 0; i < count; i++)
+                cache.Positions[i] = ReadDrawingOffset(allOutputs[i]);
         }
         var naturalPos = (PointF[])cache.Positions.Clone();
 
-        // テキストアイテムの配置設定
-        var (hAlign, vAlign, isVertical) = ReadAlignment(item);
+        // ── cleanText 内の文字位置 → outputs インデックス ─────────
+        int ToIdx(int rawPos)
+        {
+            rawPos = Math.Min(rawPos, cleanText.Length);
+            int nl = 0;
+            for (int i = 0; i < rawPos; i++)
+            {
+                char c = cleanText[i];
+                if (c == '\r' || c == '\n') nl++;
+            }
+            return Math.Clamp(rawPos - nl, 0, count);
+        }
 
-        // ── 効果テーブル ──────────────────────────────────────────
+        // ── アンカー検出 (BasePoint を自動推定) ──────────────────
+        int hKind = 1, vKind = 1;   // 0=min, 1=center, 2=max
+        static int NearestZeroKind(float a, float b, float c)
+        {
+            float da = Math.Abs(a), db = Math.Abs(b), dc = Math.Abs(c);
+            if (da <= db && da <= dc) return 0;
+            if (dc <= da && dc <= db) return 2;
+            return 1;
+        }
+        static float ByKind(float a, float b, float c, int k) => k switch { 0 => a, 2 => c, _ => b };
+
+        if (count > 1)
+        {
+            float minX = naturalPos.Min(p => p.X), maxX = naturalPos.Max(p => p.X);
+            float minY = naturalPos.Min(p => p.Y), maxY = naturalPos.Max(p => p.Y);
+            hKind = NearestZeroKind(minX, (minX + maxX) / 2f, maxX);
+            vKind = NearestZeroKind(minY, (minY + maxY) / 2f, maxY);
+        }
+
+        PointF CalcAnchor(int from, int to)
+        {
+            to = Math.Min(to, count);
+            if (from >= to) return PointF.Empty;
+            float minX = float.MaxValue, maxX = float.MinValue;
+            float minY = float.MaxValue, maxY = float.MinValue;
+            for (int i = from; i < to; i++)
+            {
+                minX = Math.Min(minX, naturalPos[i].X); maxX = Math.Max(maxX, naturalPos[i].X);
+                minY = Math.Min(minY, naturalPos[i].Y); maxY = Math.Max(maxY, naturalPos[i].Y);
+            }
+            return new PointF(ByKind(minX, (minX + maxX) / 2f, maxX, hKind),
+                              ByKind(minY, (minY + maxY) / 2f, maxY, vKind));
+        }
+
+        // ── タグ解析: appear/disappear + セグメント境界 ──────────
         var appearSec = new double[count];
-        var disappearSec = Enumerable.Repeat(double.MaxValue, count).ToArray();
-        var segmentId = new int[count];
+        var disappearSec = new double[count];
+        for (int i = 0; i < count; i++) disappearSec[i] = double.MaxValue;
 
-        var segStarts = new List<int> { 0 };
-        var clearSegs = new List<(int from, int to, double at)>();
+        var segStarts = new System.Collections.Generic.List<int> { 0 };
         double cumSec = 0.0;
         int prevClearTo = 0;
-        int currentSeg = 0;
+        var clearPairs = new System.Collections.Generic.List<(int from, int to, double at)>();
 
         var ordered = tokens.OrderBy(t => t.Pos).ToList();
         for (int ti = 0; ti < ordered.Count; ti++)
         {
             var tok = ordered[ti];
-            int pos = TagPosToListIdx(tok.Pos);
+            int pos = ToIdx(tok.Pos);
 
             switch (tok.Type)
             {
@@ -225,39 +346,42 @@ internal static class WeightTextSourcePatcher
 
                 case TagType.WaitCoeff:
                     {
-                        int nextPos = count;
-                        if (ti + 1 < ordered.Count)
-                            nextPos = TagPosToListIdx(ordered[ti + 1].Pos);
-                        cumSec += (nextPos - pos) * tok.Value;
+                        int npos = (ti + 1 < ordered.Count) ? ToIdx(ordered[ti + 1].Pos) : count;
+                        cumSec += (npos - pos) * tok.Value;
                         for (int i = pos; i < count; i++) appearSec[i] = cumSec;
                         break;
                     }
 
                 case TagType.Clear:
                     {
-                        double clearAt = cumSec + tok.Value;
-                        clearSegs.Add((prevClearTo, pos, clearAt));
+                        double at = cumSec + tok.Value;
+                        clearPairs.Add((prevClearTo, pos, at));
                         prevClearTo = pos;
-                        currentSeg++;
                         segStarts.Add(pos);
-                        for (int i = pos; i < count; i++)
-                        {
-                            segmentId[i] = currentSeg;
-                            appearSec[i] = clearAt;
-                        }
-                        cumSec = clearAt;
+                        for (int i = pos; i < count; i++) appearSec[i] = at;
+                        cumSec = at;
                         break;
                     }
 
+                case TagType.ClearCoeff:
+                    {
+                        int npos = (ti + 1 < ordered.Count) ? ToIdx(ordered[ti + 1].Pos) : count;
+                        double at = cumSec + (npos - pos) * tok.Value;
+                        clearPairs.Add((prevClearTo, pos, at));
+                        prevClearTo = pos;
+                        segStarts.Add(pos);
+                        for (int i = pos; i < count; i++) appearSec[i] = at;
+                        cumSec = at;
+                        break;
+                    }
 
                 case TagType.Position:
                     {
+                        // <p> タグ: pos 以降を (tok.X, tok.Y) からのオフセットに移動
                         if (pos >= count) break;
-                        // pos以降の可視文字のアンカー点が (X,Y) になるようにシフトする
-                        var rangeVis = AllVisIdx(pos, count);
-                        var rangeAnchor = CalcAnchor(rangeVis);
-                        float sx = (float)tok.X - rangeAnchor.X;
-                        float sy = (float)tok.Y - rangeAnchor.Y;
+                        var anchor = CalcAnchor(pos, count);
+                        float sx = (float)tok.X - anchor.X;
+                        float sy = (float)tok.Y - anchor.Y;
                         for (int i = pos; i < count; i++)
                             naturalPos[i] = new PointF(naturalPos[i].X + sx, naturalPos[i].Y + sy);
                         break;
@@ -265,279 +389,86 @@ internal static class WeightTextSourcePatcher
             }
         }
 
-        foreach (var (from, to, at) in clearSegs)
+        foreach (var (from, to, at) in clearPairs)
             for (int i = from; i < to; i++)
                 disappearSec[i] = at;
 
-        // ── クリアセグメントの位置補正 ─────────────────────────
-        // 可視文字のインデックス一覧 (改行キャラを除く)
-        // 改行に対応する output の DrawingOffset は通常の文字と大きく異なるので除外する
-        int[] AllVisIdx(int from, int to)
-        {
-            if (!listHasNl)
-                return Enumerable.Range(from, Math.Max(0, to - from)).ToArray();
-            // listHasNl の場合: 極端な位置の output は改行とみなして除外
-            // 全文字の平均位置を基準に、大きく外れるものを除外
-            var all = Enumerable.Range(from, Math.Max(0, to - from))
-                .Where(i => i < naturalPos.Length)
-                .ToArray();
-            if (all.Length <= 1) return all;
-            float avgX = all.Average(i => naturalPos[i].X);
-            float avgY = all.Average(i => naturalPos[i].Y);
-            float range = Math.Max(
-                all.Max(i => Math.Abs(naturalPos[i].X - avgX)),
-                all.Max(i => Math.Abs(naturalPos[i].Y - avgY)));
-            float thresh = range * 2f + 1f;
-            var vis = all.Where(i =>
-                Math.Abs(naturalPos[i].X - avgX) < thresh &&
-                Math.Abs(naturalPos[i].Y - avgY) < thresh).ToArray();
-            return vis.Length > 0 ? vis : all;
-        }
-
-        // フル文字列の可視インデックス
-        var fullVis = AllVisIdx(0, count);
-
-        // アンカー計算: 縦書きと横書きで主軸・副軸を入れ替える
-        // 横書き: X方向 → hAlign, Y方向 → vAlign
-        // 縦書き: X方向 → vAlign相当(右中左), Y方向 → hAlign相当(上中下)
-        PointF CalcAnchor(int[] vis)
-        {
-            if (vis.Length == 0) return PointF.Empty;
-
-            float minX = vis.Min(i => naturalPos[i].X);
-            float maxX = vis.Max(i => naturalPos[i].X);
-            float minY = vis.Min(i => naturalPos[i].Y);
-            float maxY = vis.Max(i => naturalPos[i].Y);
-            float midX = (minX + maxX) / 2f;
-            float midY = (minY + maxY) / 2f;
-
-            // 横書き・縦書き共通:
-            //   hAlign (Left/Center/Right) → X 軸の基準点
-            //   vAlign (Top/Middle/Bottom) → Y 軸の基準点
-            //
-            // 縦書きの場合、YMM4 の DrawingOffset は
-            //   X: 列の位置 (右端の列が大きい X)
-            //   Y: 列内の文字位置 (上が小さい Y)
-            // hAlign=Right → 先頭列(最大 X), Left → 末尾列(最小 X)
-            // vAlign=Top   → 列の先頭(最小 Y), Bottom → 列の末尾(最大 Y)
-            // これは横書きと同じ min/max の対応になるため共通化できる。
-
-            float ax = hAlign switch
-            {
-                HAlign.Left => minX,
-                HAlign.Center => midX,
-                HAlign.Right => maxX,
-                _ => minX,
-            };
-            float ay = vAlign switch
-            {
-                VAlign.Top => minY,
-                VAlign.Middle => midY,
-                VAlign.Bottom => maxY,
-                _ => minY,
-            };
-            return new PointF(ax, ay);
-        }
-
-        var fullAnchor = CalcAnchor(fullVis);
-
-        var segShiftX = new float[segStarts.Count];
-        var segShiftY = new float[segStarts.Count];
-
+        // ── セグメント位置揃え ─────────────────────────────────
+        // 全セグメントのアンカーを全文字のアンカーに合わせる
+        var fullAnchor = CalcAnchor(0, count);
         for (int s = 0; s < segStarts.Count; s++)
         {
             int from = segStarts[s];
             int to = (s + 1 < segStarts.Count) ? segStarts[s + 1] : count;
-            if (from >= count) continue;
-
-            var segVis = AllVisIdx(from, to);
-            var segAnchor = CalcAnchor(segVis);
-
-            segShiftX[s] = fullAnchor.X - segAnchor.X;
-            segShiftY[s] = fullAnchor.Y - segAnchor.Y;
+            var segAnchor = CalcAnchor(from, to);
+            float sx = fullAnchor.X - segAnchor.X;
+            float sy = fullAnchor.Y - segAnchor.Y;
+            for (int i = from; i < to; i++)
+                naturalPos[i] = new PointF(naturalPos[i].X + sx, naturalPos[i].Y + sy);
         }
 
-        // ── Output に書き込む ──────────────────────────────────
+        // ── DrawingOffset 書き込み & フィルタリング ──────────────
+        var elemType = allOutputs.GetType().GetGenericArguments().FirstOrDefault() ?? typeof(object);
+        var result = (IList)Activator.CreateInstance(typeof(System.Collections.Generic.List<>).MakeGenericType(elemType))!;
+
         for (int i = 0; i < count; i++)
         {
-            var output = list[i]!;
-            int seg = segmentId[i];
+            // 位置を書き込む (表示されるかどうかに関わらず自然位置を更新)
+            WriteDrawingOffset(allOutputs[i], naturalPos[i]);
 
-            _soTimeOffsetField.SetValue(output, TimeSpan.FromSeconds(-appearSec[i]));
-
-            if (_soDurationOffsetField != null)
-            {
-                TimeSpan dOff = disappearSec[i] == double.MaxValue
-                    ? TimeSpan.Zero
-                    : TimeSpan.FromSeconds(disappearSec[i]) - duration;
-                _soDurationOffsetField.SetValue(output, dOff);
-            }
-
-            WriteOffset(output, new PointF(
-                naturalPos[i].X + segShiftX[seg],
-                naturalPos[i].Y + segShiftY[seg]));
+            // タイミングフィルタ
+            if (now < appearSec[i]) continue;
+            if (disappearSec[i] != double.MaxValue && now >= disappearSec[i]) continue;
+            result.Add(allOutputs[i]);
         }
 
-        RebuildOutputs(ts, list, now, duration);
+        // output[0] の書き込み後の位置を記録 (次フレームのキャッシュ検証用)
+        if (count > 0) cache.LastWrittenPos0 = naturalPos[0];
+
+        SetOutputs(ts, info, result);
     }
 
-    // =================================================================
-    // 配置設定の読み取り
-    // =================================================================
+    // ================================================================= DrawingOffset 読み書き
 
-    private enum HAlign { Left, Center, Right }
-    private enum VAlign { Top, Middle, Bottom }
-
-    private static (HAlign h, VAlign v, bool isVertical) ReadAlignment(object item)
+    private static void EnsureDrawingOffsetField(object output)
     {
-        if (_textItemType == null) return (HAlign.Left, VAlign.Top, false);
-
-        // ── 縦書き判定 ────────────────────────────────────────────
-        bool isV = false;
-        foreach (var wProp in new[] { "WritingMode", "TextDirection", "Direction", "VerticalText" })
+        if (_drawingOffsetField != null) return;
+        lock (_drawingOffsetLock)
         {
-            var wval = _textItemType
-                .GetProperty(wProp, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                ?.GetValue(item)?.ToString() ?? "";
-            if (wval.Length == 0) continue;
-            isV = wval.Contains("Vertical", StringComparison.OrdinalIgnoreCase)
-               || wval.Contains("Tate", StringComparison.OrdinalIgnoreCase)
-               || wval == "1" || wval == "2" || wval == "True";
-            break;
+            if (_drawingOffsetField != null) return;
+            var t = output.GetType();
+            // バッキングフィールドまたは camelCase フィールドを探す
+            _drawingOffsetField =
+                t.GetField("<DrawingOffset>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? t.GetField("drawingOffset", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? t.GetField("_drawingOffset", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? t.GetProperty("DrawingOffset", BindingFlags.Instance | BindingFlags.Public)?
+                    .GetType().GetField("value");  // fallback (通常不要)
         }
+    }
 
-        // ── 配置設定の読み取り ────────────────────────────────────
-        // パターン1: 水平・垂直を別プロパティで保持
-        // パターン2: BasePoint 単一プロパティ (例: "TopCenter", "MiddleLeft")
-        // パターン3: 数値 enum (0=TL,1=TC,2=TR,3=ML,4=MC,5=MR,6=BL,7=BC,8=BR)
+    private static PointF ReadDrawingOffset(object output)
+    {
+        if (_drawingOffsetField == null) return PointF.Empty;
+        return ToPointF(_drawingOffsetField.GetValue(output));
+    }
 
-        HAlign h = HAlign.Left;
-        VAlign v = VAlign.Top;
-        bool parsed = false;
-
-        var hStr = ReadPropStr(item, "HorizontalAlignment", "TextHorizontalAlignment", "AlignX");
-        var vStr = ReadPropStr(item, "VerticalAlignment", "TextVerticalAlignment", "AlignY");
-        if (hStr != null) { h = ParseHStr(hStr); parsed = true; }
-        if (vStr != null) { v = ParseVStr(vStr); parsed = true; }
-
-        if (!parsed)
+    private static void WriteDrawingOffset(object output, PointF v)
+    {
+        if (_drawingOffsetField == null) return;
+        var ft = _drawingOffsetField.FieldType;
+        if (ft == typeof(PointF))
         {
-            var bp = ReadPropStr(item, "BasePoint", "Alignment", "TextAlignment", "AnchorPoint") ?? "";
-
-            // 数値: 0=TL,1=TC,2=TR,3=ML,4=MC,5=MR,6=BL,7=BC,8=BR
-            if (int.TryParse(bp, out int num))
-            {
-                h = (HAlign)(num % 3);
-                v = (VAlign)(num / 3);
-            }
-            else
-            {
-                var words = Regex.Matches(bp, "[A-Z][a-z]+|[A-Z]+(?=[A-Z]|$)")
-                    .Select(m => m.Value)
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                h = ParseHWords(words);
-                v = ParseVWords(words);
-            }
+            _drawingOffsetField.SetValue(output, v);
+            return;
         }
-
-        return (h, v, isV);
-    }
-
-    private static string? ReadPropStr(object item, params string[] names)
-    {
-        if (_textItemType == null) return null;
-        foreach (var name in names)
-        {
-            var val = _textItemType
-                .GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                ?.GetValue(item)?.ToString();
-            if (!string.IsNullOrEmpty(val)) return val;
-        }
-        return null;
-    }
-
-    private static HAlign ParseHStr(string s)
-    {
-        if (int.TryParse(s, out int n)) return (HAlign)Math.Clamp(n, 0, 2);
-        if (s.Contains("Center", StringComparison.OrdinalIgnoreCase)
-         || s.Contains("Centre", StringComparison.OrdinalIgnoreCase)) return HAlign.Center;
-        if (s.Contains("Right", StringComparison.OrdinalIgnoreCase)) return HAlign.Right;
-        return HAlign.Left;
-    }
-
-    private static VAlign ParseVStr(string s)
-    {
-        if (int.TryParse(s, out int n)) return (VAlign)Math.Clamp(n, 0, 2);
-        if (s.Contains("Middle", StringComparison.OrdinalIgnoreCase)
-         || s.Contains("Center", StringComparison.OrdinalIgnoreCase)
-         || s.Contains("Centre", StringComparison.OrdinalIgnoreCase)) return VAlign.Middle;
-        if (s.Contains("Bottom", StringComparison.OrdinalIgnoreCase)
-         || s.Contains("Lower", StringComparison.OrdinalIgnoreCase)) return VAlign.Bottom;
-        return VAlign.Top;
-    }
-
-    private static HAlign ParseHWords(HashSet<string> words)
-    {
-        if (words.Contains("Center") || words.Contains("Centre")) return HAlign.Center;
-        if (words.Contains("Right")) return HAlign.Right;
-        return HAlign.Left;
-    }
-
-    private static VAlign ParseVWords(HashSet<string> words)
-    {
-        if (words.Contains("Upper") || words.Contains("Top")) return VAlign.Top;
-        else if (words.Contains("Middle")) return VAlign.Middle;
-        else if (words.Contains("Lower") || words.Contains("Bottom")) return VAlign.Bottom;
-        return VAlign.Top;
-    }
-
-    // =================================================================
-    // Outputs 再構築
-    // =================================================================
-
-    private static void RebuildOutputs(object ts, IList all, TimeSpan now, TimeSpan dur)
-    {
-        if (_tsOutputsProp == null) return;
-
-        var elemType = all.GetType().GetGenericArguments()[0];
-        var result = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(elemType))!;
-
-        foreach (var output in all)
-        {
-            if (output == null) continue;
-            var tOff = _soTimeOffsetField != null ? (TimeSpan)_soTimeOffsetField.GetValue(output)! : TimeSpan.Zero;
-            var dOff = _soDurationOffsetField != null ? (TimeSpan)_soDurationOffsetField.GetValue(output)! : TimeSpan.Zero;
-
-            if (now + tOff < TimeSpan.Zero) continue;
-            if (dOff != TimeSpan.Zero && now >= dur + dOff) continue;
-
-            result.Add(output);
-        }
-
-        _tsOutputsProp.SetValue(ts, result);
-    }
-
-    // =================================================================
-    // DrawingOffset 読み書き
-    // =================================================================
-
-    private static PointF ReadOffset(object output)
-    {
-        if (_soDrawingOffsetField == null) return PointF.Empty;
-        return ToPointF(_soDrawingOffsetField.GetValue(output));
-    }
-
-    private static void WriteOffset(object output, PointF v)
-    {
-        if (_soDrawingOffsetField == null) return;
-        var ft = _soDrawingOffsetField.FieldType;
-        if (ft == typeof(PointF)) { _soDrawingOffsetField.SetValue(output, v); return; }
+        // 独自構造体の場合 (X/Y フィールドに書き込む)
         try
         {
             var inst = Activator.CreateInstance(ft)!;
             (ft.GetField("X") ?? ft.GetField("x"))?.SetValue(inst, Convert.ChangeType(v.X, typeof(float)));
             (ft.GetField("Y") ?? ft.GetField("y"))?.SetValue(inst, Convert.ChangeType(v.Y, typeof(float)));
-            _soDrawingOffsetField.SetValue(output, inst);
+            _drawingOffsetField.SetValue(output, inst);
         }
         catch { }
     }
@@ -553,36 +484,87 @@ internal static class WeightTextSourcePatcher
     }
     private static float ToF(object? v) => v == null ? 0f : Convert.ToSingle(v);
 
-    // =================================================================
-    // ヘルパー
-    // =================================================================
+    // ================================================================= キャッシュ
 
-    private static void EnsureCache(object first)
+    private static SourceTypeInfo? GetInfo(object src)
     {
-        if (_soTimeOffsetField != null) return;
-        var t = first.GetType();
-        _soTimeOffsetField = BF(t, "TimeOffset");
-        _soDurationOffsetField = BF(t, "DurationOffset");
-        _soDrawingOffsetField = BF(t, "DrawingOffset");
+        var t = src.GetType();
+        lock (_cacheLock)
+        {
+            if (_typeCache.TryGetValue(t, out var cached)) return cached;
+        }
+
+        if (FindField(t, "outputs") == null || FindField(t, "isDevided", "isDivided") == null)
+        {
+            lock (_cacheLock) { _typeCache[t] = null; }
+            return null;
+        }
+
+        var itemFld = t.GetField("item", BindingFlags.Instance | BindingFlags.NonPublic);
+        var outsProp = t.GetProperty("Outputs", BindingFlags.Instance | BindingFlags.Public);
+
+        if (itemFld == null || outsProp == null)
+        {
+            lock (_cacheLock) { _typeCache[t] = null; }
+            return null;
+        }
+
+        var captured = itemFld;
+        static string? ReadText(FieldInfo fld, object s)
+        {
+            var item = fld.GetValue(s);
+            if (item == null) return null;
+            foreach (var name in new[] { "Serif", "Text", "Body", "Content" })
+            {
+                var v = item.GetType()
+                    .GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?.GetValue(item) as string;
+                if (v != null) return v;
+            }
+            return null;
+        }
+
+        var info = new SourceTypeInfo
+        {
+            ItemField = itemFld,
+            OutputsProp = outsProp,
+            GetText = s => ReadText(captured, s),
+        };
+        lock (_cacheLock) { _typeCache[t] = info; }
+        return info;
     }
 
-    private static FieldInfo? BF(Type t, string name)
-        => t.GetField($"<{name}>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)
-        ?? t.GetField(char.ToLower(name[0]) + name[1..], BindingFlags.Instance | BindingFlags.NonPublic)
-        ?? t.GetField("_" + char.ToLower(name[0]) + name[1..], BindingFlags.Instance | BindingFlags.NonPublic)
-        ?? t.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+    // ================================================================= ヘルパー
 
-    private static FieldInfo? NF(Type t, string name)
-        => t.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
-
-    private static TimeSpan GetTime(object desc, string propName)
+    private static void SetOutputs(object ts, SourceTypeInfo info, IList value)
     {
+        var setter = info.OutputsProp.GetSetMethod(nonPublic: true);
+        if (setter != null) { setter.Invoke(ts, new object[] { value }); return; }
+        var bf = ts.GetType().GetField("<Outputs>k__BackingField",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        bf?.SetValue(ts, value);
+    }
+
+    private static double GetTimeSec(object? desc, string prop)
+    {
+        if (desc == null) return 0.0;
         try
         {
-            var inner = desc.GetType().GetProperty(propName)?.GetValue(desc);
+            var inner = desc.GetType().GetProperty(prop)?.GetValue(desc);
             var time = inner?.GetType().GetProperty("Time")?.GetValue(inner);
-            return time is TimeSpan ts ? ts : TimeSpan.Zero;
+            return time is TimeSpan ts ? ts.TotalSeconds : 0.0;
         }
-        catch { return TimeSpan.Zero; }
+        catch { return 0.0; }
+    }
+
+    private static FieldInfo? FindField(Type t, params string[] names)
+    {
+        for (var cur = t; cur != null && cur != typeof(object); cur = cur.BaseType)
+            foreach (var name in names)
+            {
+                var f = cur.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+                if (f != null) return f;
+            }
+        return null;
     }
 }
